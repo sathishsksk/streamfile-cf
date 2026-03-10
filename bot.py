@@ -23,8 +23,13 @@ mongo = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
 db    = mongo["filebot"]
 
 # ── Pyrogram Bot ──────────────────────────────────────────────────────────────
-bot = Client("session", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_token=Config.BOT_TOKEN)
-
+bot = Client(
+    "session",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+    in_memory=True,
+)
 # ══════════════════ HELPERS ═══════════════════════════════════════════════════
 
 def fmt_size(b):
