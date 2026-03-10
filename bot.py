@@ -310,18 +310,27 @@ def build_web_app():
 
 # ══════════════════ MAIN ══════════════════════════════════════════════════════
 
-async def main():
-    log.info("🚀 Starting File-To-Link Bot (4 GB support)")
-    await bot.start()
-    me = await bot.get_me()
-    log.info(f"✅ Bot: @{me.username}")
-
+async def start_web_server():
+    """Start aiohttp web server as background task."""
     runner = web.AppRunner(build_web_app())
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", Config.PORT).start()
     log.info(f"✅ Web server on port {Config.PORT}")
 
+async def main():
+    log.info("🚀 Starting File-To-Link Bot (4 GB support)")
+
+    # Start web server as a background asyncio task
+    # This runs alongside Pyrogram without blocking it
+    asyncio.get_event_loop().create_task(start_web_server())
+
+    me = await bot.get_me()
+    log.info(f"✅ Bot: @{me.username}")
+
+    # Let Pyrogram fully own the idle loop
     await idle()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Use bot.run() — Pyrogram's own entry point
+    # This properly manages the entire asyncio lifecycle
+    bot.run(main())
