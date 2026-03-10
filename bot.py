@@ -320,14 +320,15 @@ async def start_web_server():
 async def main():
     log.info("🚀 Starting File-To-Link Bot (4 GB support)")
 
-    # Start web server as a background asyncio task
-    # This runs alongside Pyrogram without blocking it
+    # Start bot FIRST
+    await bot.start()
+
+    # Start web server as background task
     asyncio.get_event_loop().create_task(start_web_server())
 
     me = await bot.get_me()
     log.info(f"✅ Bot: @{me.username}")
 
-    # Let Pyrogram fully own the idle loop
     await idle()
 
 if __name__ == "__main__":
