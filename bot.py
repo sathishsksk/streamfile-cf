@@ -10,7 +10,7 @@ from datetime import datetime
 
 import motor.motor_asyncio
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FileIdInvalid
 from config import Config
@@ -321,7 +321,7 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", Config.PORT).start()
     log.info(f"✅ Web server on port {Config.PORT}")
 
-    await asyncio.Event().wait()  # run forever
+    await idle()
 
 if __name__ == "__main__":
     asyncio.run(main())
