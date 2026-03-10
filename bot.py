@@ -314,7 +314,7 @@ async def stream_handler(request: web.Request):
     mime      = info.get("mime_type", "application/octet-stream")
     file_name = info.get("file_name", "file")
 
-    # Handle Range header for video seeking / resume
+    # Parse Range header
     range_hdr = request.headers.get("Range", "")
     start, end = 0, max(file_size - 1, 0)
 
@@ -323,6 +323,14 @@ async def stream_handler(request: web.Request):
         if m:
             start = int(m.group(1))
             end   = int(m.group(2)) if m.group(2) else file_size - 1
+
+    # ── KEY FIX ───────────────────────────────────────────────────────────────
+    # Pyrogram stream_media offset MUST be aligned to 1 MB (1048576 bytes)
+    # We align DOWN to nearest 1MB boundary, then skip bytes up to real start
+    CHUNK_SIZE  = 1024 * 1024          # 1 MB
+    offset      = (start // CHUNK_SIZE) * CHUNK_SIZE   # aligned offset
+    skip_bytes  = start - offset                        # bytes to skip at start
+    # ─────────────────────────────────────────────────────────────────────────
 
     headers = {
         "Content-Type"               : mime,
@@ -340,14 +348,24 @@ async def stream_handler(request: web.Request):
     await response.prepare(request)
 
     remaining = (end - start + 1) if file_size else None
+    first_chunk = True
+
     try:
-        async for chunk in bot.stream_media(file_id, offset=start):
+        async for chunk in bot.stream_media(file_id, offset=offset):
+            # Skip bytes at start of first chunk (offset alignment correction)
+            if first_chunk:
+                chunk       = chunk[skip_bytes:]
+                first_chunk = False
+
             if remaining is not None:
                 if remaining <= 0:
                     break
                 chunk     = chunk[:remaining]
                 remaining -= len(chunk)
-            await response.write(chunk)
+
+            if chunk:
+                await response.write(chunk)
+
     except FileIdInvalid:
         log.error(f"FileIdInvalid for token: {token}")
     except Exception as e:
