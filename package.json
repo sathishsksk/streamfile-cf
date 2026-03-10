@@ -1,0 +1,12 @@
+{
+  "name": "file-to-link-cf-worker",
+  "version": "2.0.0",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "set-koyeb": "wrangler secret put KOYEB_URL"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
