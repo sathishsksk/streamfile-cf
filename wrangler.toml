@@ -2,30 +2,7 @@ name = "file-to-link-bot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-# ──────────────────────────────────────────────
-# KV Namespace — stores file tokens & user sessions
-# Run: wrangler kv:namespace create "FILES_KV"
-# Then paste the returned id below
-# ──────────────────────────────────────────────
-[[kv_namespaces]]
-binding = "FILES_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
-
-# ──────────────────────────────────────────────
-# Secrets (set via: wrangler secret put SECRET_NAME)
-# DO NOT put real values here — use wrangler secret put
-# ──────────────────────────────────────────────
-# BOT_TOKEN       — From @BotFather
-# API_ID          — From my.telegram.org
-# API_HASH        — From my.telegram.org
-# BIN_CHANNEL     — Channel ID (e.g. -1001234567890)
-# MY_PASS         — Optional password protection
-# OWNER_ID        — Your Telegram user ID
-# UPDATES_CHANNEL — Optional: public channel username (no @)
-
-# ──────────────────────────────────────────────
-# Optional: Custom domain
-# ──────────────────────────────────────────────
-# routes = [
-#   { pattern = "yourdomain.com/*", zone_name = "yourdomain.com" }
-# ]
+# No KV needed — metadata served live from Koyeb /info/{token}
+# Only 1 secret needed:
+#   wrangler secret put KOYEB_URL
+#   → paste: https://your-app-yourname.koyeb.app

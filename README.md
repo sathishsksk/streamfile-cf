@@ -1,134 +1,225 @@
-# 📁 File-To-Link Bot — Cloudflare Workers Edition
-
-Rewritten from Python (Koyeb/Heroku polling) → JavaScript (Cloudflare Workers webhook).
-**Zero sleep. Global CDN. 100% Free.**
+# File-To-Link Bot — Solution 1 (Hybrid)
+## Koyeb + Pyrogram MTProto + Cloudflare R2 + D1
 
 ---
 
-## ✅ What's New vs the Original Python Bot
+## Architecture
 
-| Feature              | Original (Python/Koyeb) | This (Cloudflare Workers) |
-|----------------------|------------------------|--------------------------|
-| Sleep issue          | ❌ Sleeps when idle     | ✅ Never sleeps           |
-| Cold start           | ~30 seconds            | ~0ms (instant)            |
-| Mode                 | Polling                | Webhook                   |
-| Language             | Python                 | JavaScript                |
-| File storage         | Heroku dynos           | Cloudflare KV             |
-| Cost                 | Free (limited)         | Free (100k req/day)       |
-| Custom domain        | ✅                      | ✅                         |
-| Channel auto-links   | ✅                      | ✅                         |
-| Password protection  | ✅                      | ✅                         |
+```
+User sends file (up to 4 GB)
+        ↓
+Telegram Bot (Koyeb — Pyrogram MTProto)
+        ↓ streams via MTProto
+Cloudflare R2 (file storage — 10GB free)
+        ↓
+Cloudflare D1 (metadata database — free)
+        ↓
+Cloudflare Worker (serves download page + streams file)
+        ↓
+User gets CDN download link ⚡
+```
 
 ---
 
-## 🚀 Deploy in 5 Steps
+## Method 3 — Manual Delete Commands (Owner Only)
 
-### Step 1 — Install Wrangler CLI
+| Command | Action |
+|---|---|
+| `/storage` | Show R2 usage stats |
+| `/delete {token}` | Delete specific file from R2 + D1 |
+| `/clear` | Ask confirmation to delete all files |
+| `/confirmclear` | Actually delete ALL files from R2 + D1 |
+
+---
+
+## Part 1 — Cloudflare Setup
+
+### Step 1 — Create R2 Bucket
+
+1. Go to https://dash.cloudflare.com
+2. Click **R2** in left sidebar
+3. Click **Create bucket**
+4. Name: `filebot`
+5. Click **Create bucket** ✅
+
+### Step 2 — Get R2 API Keys
+
+1. On R2 page → click **Manage R2 API Tokens**
+2. Click **Create API Token**
+3. Permissions: **Object Read & Write**
+4. Click **Create API Token**
+5. Save these — you will need them:
+   - **Access Key ID**   → `R2_ACCESS_KEY`
+   - **Secret Access Key** → `R2_SECRET_KEY`
+   - **Account ID** (top right of R2 page) → `R2_ACCOUNT_ID`
+
+### Step 3 — Create D1 Database
+
 ```bash
+# Install wrangler
 npm install -g wrangler
+
+# Login
 wrangler login
-```
 
-### Step 2 — Clone this repo & install deps
-```bash
-git clone https://github.com/YOUR_USERNAME/file-to-link-cf
-cd file-to-link-cf
-npm install
+# Create D1 database
+wrangler d1 create filebot-db
 ```
+Copy the `database_id` from output → paste into `cf-worker/wrangler.toml`
 
-### Step 3 — Create KV Namespace
-```bash
-npm run setup-kv
-```
-This outputs something like:
-```
-{ binding = "FILES_KV", id = "abc123def456..." }
-```
-Copy the `id` value and paste it into `wrangler.toml`:
 ```toml
-[[kv_namespaces]]
-binding = "FILES_KV"
-id = "abc123def456..."   ← paste here
+# wrangler.toml — replace this line:
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+# with your actual database_id
 ```
 
-### Step 4 — Set Secrets
+### Step 4 — Init D1 Schema
+
 ```bash
-# Required
-npm run set-token       # Paste your BOT_TOKEN from @BotFather
-npm run set-channel     # Paste BIN_CHANNEL id (e.g. -1001234567890)
-npm run set-owner       # Your Telegram user ID
-
-# Optional
-npm run set-pass        # Password to protect the bot
-wrangler secret put UPDATES_CHANNEL   # Public channel username (no @)
+cd cf-worker
+wrangler d1 execute filebot-db --file=schema.sql
 ```
 
-### Step 5 — Deploy
+### Step 5 — Deploy CF Worker
+
 ```bash
-npm run deploy
+cd cf-worker
+npm install
+wrangler deploy
 ```
-You'll get a URL like: `https://file-to-link-bot.YOUR_NAME.workers.dev`
 
-### Step 6 — Register Webhook (ONE TIME ONLY)
-Open this in your browser:
-```
-https://file-to-link-bot.YOUR_NAME.workers.dev/setup
-```
-You'll see `"webhook_set": { "ok": true }` — done! ✅
+Note the Worker URL: `https://file-to-link-bot.yourname.workers.dev`
 
----
+### Step 6 — Set API Secret
 
-## 📋 Environment Variables Reference
-
-| Variable          | Required | Description                                      |
-|-------------------|----------|--------------------------------------------------|
-| `BOT_TOKEN`       | ✅        | From [@BotFather](https://t.me/BotFather)        |
-| `BIN_CHANNEL`     | ✅        | Channel ID where files are stored (e.g. -100...) |
-| `OWNER_ID`        | ✅        | Your Telegram user ID                            |
-| `MY_PASS`         | ❌        | Password to protect the bot (optional)           |
-| `UPDATES_CHANNEL` | ❌        | Public channel username shown in /start button   |
-
----
-
-## 🔗 URL Routes
-
-| Route             | Description                                  |
-|-------------------|----------------------------------------------|
-| `POST /webhook`   | Telegram sends all bot updates here          |
-| `GET  /`          | Status / home page                           |
-| `GET  /setup`     | Registers webhook with Telegram (run once)   |
-| `GET  /file/{token}` | Beautiful download page (HTML)            |
-| `GET  /dl/{token}`   | Direct file download / stream              |
-
----
-
-## 📱 Bot Commands
-
-| Command | Description         |
-|---------|---------------------|
-| /start  | Welcome message     |
-| /help   | Show help           |
-| /ping   | Check bot latency   |
-
-Send any **file, video, audio, photo** → get instant download link!
-
----
-
-## ⚠️ Important Notes
-
-1. **Add bot to BIN_CHANNEL as Admin** — the bot forwards files there for permanent access
-2. **Telegram file size limit** — Bots can only access files up to **20MB** via `getFile` API. Larger files need a User Bot (MTProto) approach.
-3. **File links expire** — Telegram's `file_path` URLs are temporary, but we always fetch fresh ones on download, so links stay valid as long as the KV token exists (30 days by default).
-
----
-
-## 🛠️ Local Development
 ```bash
-npm run dev
-# Then use ngrok or cloudflared to expose localhost for webhook testing
+wrangler secret put API_SECRET
+# Type a strong random password when prompted
+# Example: mySecretKey123!@#
+# Save this — you need it as API_SECRET in Koyeb
 ```
 
-## 📊 View Logs
-```bash
-npm run logs
+---
+
+## Part 2 — Koyeb Setup
+
+### Step 1 — Push code to GitHub
+
+Push these files to your GitHub repo:
+```
+bot.py
+config.py
+requirements.txt
+Dockerfile
+```
+
+### Step 2 — Deploy on Koyeb
+
+1. Go to https://app.koyeb.com
+2. Click **Create App** → **GitHub**
+3. Select your repo
+4. Builder: **Dockerfile**
+5. Port: **8080**
+6. Health check path: `/health`
+
+### Step 3 — Set Environment Variables
+
+| Variable | Where to get |
+|---|---|
+| `API_ID` | https://my.telegram.org |
+| `API_HASH` | https://my.telegram.org |
+| `BOT_TOKEN` | @BotFather on Telegram |
+| `OWNER_ID` | Message @userinfobot on Telegram |
+| `CF_WORKER_URL` | Your Worker URL from Step 5 above |
+| `API_SECRET` | Same password you set in Step 6 above |
+| `R2_ACCOUNT_ID` | Cloudflare dashboard (top right of R2 page) |
+| `R2_ACCESS_KEY` | From R2 API token (Step 2) |
+| `R2_SECRET_KEY` | From R2 API token (Step 2) |
+| `R2_BUCKET_NAME` | `filebot` |
+| `PORT` | `8080` |
+| `MY_PASS` | Optional — password protect the bot |
+| `UPDATES_CHANNEL` | Optional — your channel username |
+
+### Step 4 — Deploy
+
+Click **Deploy** → wait ~2 minutes → test:
+```
+https://your-app.koyeb.app/health
+```
+Should return: `OK`
+
+---
+
+## Part 3 — Keep Alive (Prevent Koyeb sleep)
+
+Create `.github/workflows/keep_alive.yml` in your repo:
+
+```yaml
+name: Keep Alive
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping
+        run: curl -s ${{ secrets.KOYEB_URL }}/health
+```
+
+Add `KOYEB_URL` as a GitHub repository secret.
+
+Also set up https://uptimerobot.com — free monitor every 5 min.
+
+---
+
+## Test Your Bot
+
+1. Open Telegram → find your bot
+2. Send `/start`
+3. Send any file
+4. Bot replies with ✅ Link Ready + token
+5. Click Download → file streams from Cloudflare R2 ⚡
+
+## Test Delete Commands
+
+```
+/storage                              → see R2 usage
+/delete abc123def456abc123def456abc   → delete specific file
+/clear                                → asks confirmation
+/confirmclear                         → deletes everything
+```
+
+---
+
+## Free Tier Limits Summary
+
+| Service | Limit |
+|---|---|
+| CF Worker requests | 100,000/day |
+| R2 storage | 10 GB total |
+| R2 reads | 1,000,000/month |
+| R2 writes | 1,000,000/month |
+| R2 **bandwidth** | ♾️ **Unlimited — $0 forever** |
+| D1 reads | 5,000,000/day |
+| D1 writes | 100,000/day |
+
+---
+
+## File Structure
+
+```
+solution1/
+├── koyeb-bot/
+│   ├── bot.py           ← Python bot (Pyrogram + R2 upload)
+│   ├── config.py        ← All env vars
+│   ├── requirements.txt
+│   └── Dockerfile
+└── cf-worker/
+    ├── src/
+    │   └── index.js     ← CF Worker (downloads + API)
+    ├── schema.sql        ← D1 database schema
+    ├── wrangler.toml     ← CF config
+    └── package.json
 ```
