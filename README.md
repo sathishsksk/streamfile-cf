@@ -1,161 +1,225 @@
-# 📁 File-To-Link Bot — Koyeb + Cloudflare (4 GB Support)
+# File-To-Link Bot — Solution 1 (Hybrid)
+## Koyeb + Pyrogram MTProto + Cloudflare R2 + D1
+
+---
 
 ## Architecture
 
 ```
 User sends file (up to 4 GB)
-        │
-        ▼
-┌─────────────────────┐
-│  Python Bot (Koyeb) │  ← Pyrogram MTProto handles all file sizes
-│  bot.py             │  ← aiohttp server streams bytes on /stream/{token}
-│  port 8080          │  ← MongoDB stores token → file_id mapping
-└────────┬────────────┘
-         │ file stored in BIN_CHANNEL
-         │ token saved to MongoDB
-         │
-         ▼
-  Link sent to user:  https://your-worker.workers.dev/file/{token}
-         │
-         ▼
-┌─────────────────────────┐
-│  Cloudflare Worker      │  ← Serves download page
-│  /file/{token}          │  ← Fetches metadata from Koyeb /info/{token}
-│  /dl/{token}            │  ← Proxies stream from Koyeb /stream/{token}
-└─────────────────────────┘
-         │
-         ▼
-    User downloads at full speed via Cloudflare CDN
+        ↓
+Telegram Bot (Koyeb — Pyrogram MTProto)
+        ↓ streams via MTProto
+Cloudflare R2 (file storage — 10GB free)
+        ↓
+Cloudflare D1 (metadata database — free)
+        ↓
+Cloudflare Worker (serves download page + streams file)
+        ↓
+User gets CDN download link ⚡
 ```
 
 ---
 
-## PART 1 — Deploy Python Bot on Koyeb
+## Method 3 — Manual Delete Commands (Owner Only)
 
-### Step 1 — Push python-bot folder to GitHub
-
-Create a new GitHub repo and push these files:
-- `bot.py`
-- `config.py`
-- `requirements.txt`
-- `Dockerfile`
-
-### Step 2 — Create MongoDB (free)
-
-1. Go to **mongodb.com/atlas** → Free tier → Create cluster
-2. Database Access → Add user → copy username/password
-3. Network Access → Allow from anywhere (0.0.0.0/0)
-4. Connect → Drivers → copy URI like:
-   `mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true`
-
-### Step 3 — Deploy on Koyeb
-
-1. Go to **app.koyeb.com** → Create App
-2. Source: **GitHub** → select your repo
-3. Builder: **Dockerfile** ← important!
-4. Port: **8080**
-5. Add Environment Variables:
-
-| Variable        | Value                                      |
-|-----------------|--------------------------------------------|
-| `API_ID`        | From my.telegram.org                       |
-| `API_HASH`      | From my.telegram.org                       |
-| `BOT_TOKEN`     | From @BotFather                            |
-| `BIN_CHANNEL`   | Your channel ID e.g. `-1001234567890`      |
-| `OWNER_ID`      | Your Telegram user ID                      |
-| `DATABASE_URL`  | MongoDB Atlas URI                          |
-| `CF_WORKER_URL` | Your CF Worker URL (fill in after Part 2)  |
-| `KOYEB_URL`     | Your Koyeb app URL (auto-assigned)         |
-| `MY_PASS`       | Optional password                          |
-| `UPDATES_CHANNEL` | Optional channel username               |
-
-6. Deploy → wait for green ✅
-7. Copy your Koyeb URL: `https://your-app-yourname.koyeb.app`
-8. Test it: open `https://your-app-yourname.koyeb.app/health` → should show `OK`
+| Command | Action |
+|---|---|
+| `/storage` | Show R2 usage stats |
+| `/delete {token}` | Delete specific file from R2 + D1 |
+| `/clear` | Ask confirmation to delete all files |
+| `/confirmclear` | Actually delete ALL files from R2 + D1 |
 
 ---
 
-## PART 2 — Deploy Cloudflare Worker
+## Part 1 — Cloudflare Setup
 
-### Step 1 — Install Wrangler
+### Step 1 — Create R2 Bucket
+
+1. Go to https://dash.cloudflare.com
+2. Click **R2** in left sidebar
+3. Click **Create bucket**
+4. Name: `filebot`
+5. Click **Create bucket** ✅
+
+### Step 2 — Get R2 API Keys
+
+1. On R2 page → click **Manage R2 API Tokens**
+2. Click **Create API Token**
+3. Permissions: **Object Read & Write**
+4. Click **Create API Token**
+5. Save these — you will need them:
+   - **Access Key ID**   → `R2_ACCESS_KEY`
+   - **Secret Access Key** → `R2_SECRET_KEY`
+   - **Account ID** (top right of R2 page) → `R2_ACCOUNT_ID`
+
+### Step 3 — Create D1 Database
+
+```bash
+# Install wrangler
+npm install -g wrangler
+
+# Login
+wrangler login
+
+# Create D1 database
+wrangler d1 create filebot-db
+```
+Copy the `database_id` from output → paste into `cf-worker/wrangler.toml`
+
+```toml
+# wrangler.toml — replace this line:
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+# with your actual database_id
+```
+
+### Step 4 — Init D1 Schema
+
+```bash
+cd cf-worker
+wrangler d1 execute filebot-db --file=schema.sql
+```
+
+### Step 5 — Deploy CF Worker
+
 ```bash
 cd cf-worker
 npm install
-wrangler login
+wrangler deploy
 ```
 
-### Step 2 — Set your Koyeb URL secret
-```bash
-npm run set-koyeb
-# Paste: https://your-app-yourname.koyeb.app
-```
+Note the Worker URL: `https://file-to-link-bot.yourname.workers.dev`
 
-### Step 3 — Deploy
+### Step 6 — Set API Secret
+
 ```bash
-npm run deploy
+wrangler secret put API_SECRET
+# Type a strong random password when prompted
+# Example: mySecretKey123!@#
+# Save this — you need it as API_SECRET in Koyeb
 ```
-You'll get: `https://file-to-link-bot.yourname.workers.dev`
 
 ---
 
-## PART 3 — Connect Both Together
+## Part 2 — Koyeb Setup
 
-### Update Koyeb env vars
+### Step 1 — Push code to GitHub
 
-Go back to Koyeb → your app → Environment:
-- `CF_WORKER_URL` = `https://file-to-link-bot.yourname.workers.dev`
+Push these files to your GitHub repo:
+```
+bot.py
+config.py
+requirements.txt
+Dockerfile
+```
 
-Redeploy the Koyeb app.
+### Step 2 — Deploy on Koyeb
+
+1. Go to https://app.koyeb.com
+2. Click **Create App** → **GitHub**
+3. Select your repo
+4. Builder: **Dockerfile**
+5. Port: **8080**
+6. Health check path: `/health`
+
+### Step 3 — Set Environment Variables
+
+| Variable | Where to get |
+|---|---|
+| `API_ID` | https://my.telegram.org |
+| `API_HASH` | https://my.telegram.org |
+| `BOT_TOKEN` | @BotFather on Telegram |
+| `OWNER_ID` | Message @userinfobot on Telegram |
+| `CF_WORKER_URL` | Your Worker URL from Step 5 above |
+| `API_SECRET` | Same password you set in Step 6 above |
+| `R2_ACCOUNT_ID` | Cloudflare dashboard (top right of R2 page) |
+| `R2_ACCESS_KEY` | From R2 API token (Step 2) |
+| `R2_SECRET_KEY` | From R2 API token (Step 2) |
+| `R2_BUCKET_NAME` | `filebot` |
+| `PORT` | `8080` |
+| `MY_PASS` | Optional — password protect the bot |
+| `UPDATES_CHANNEL` | Optional — your channel username |
+
+### Step 4 — Deploy
+
+Click **Deploy** → wait ~2 minutes → test:
+```
+https://your-app.koyeb.app/health
+```
+Should return: `OK`
 
 ---
 
-## PART 4 — Keep Koyeb Alive (No Sleep)
+## Part 3 — Keep Alive (Prevent Koyeb sleep)
 
-Add this GitHub Actions file to your repo at `.github/workflows/keep_alive.yml`:
+Create `.github/workflows/keep_alive.yml` in your repo:
 
 ```yaml
 name: Keep Alive
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Koyeb
+      - name: Ping
         run: curl -s ${{ secrets.KOYEB_URL }}/health
 ```
 
-Add `KOYEB_URL` as a GitHub secret in your repo settings.
+Add `KOYEB_URL` as a GitHub repository secret.
+
+Also set up https://uptimerobot.com — free monitor every 5 min.
 
 ---
 
-## Quick Test
+## Test Your Bot
 
-1. Start your Telegram bot → send `/start`
-2. Send a file (any size up to 4 GB)
-3. Bot replies with download link
-4. Click link → opens Cloudflare download page
-5. Click Download → file streams via Cloudflare CDN ⚡
+1. Open Telegram → find your bot
+2. Send `/start`
+3. Send any file
+4. Bot replies with ✅ Link Ready + token
+5. Click Download → file streams from Cloudflare R2 ⚡
+
+## Test Delete Commands
+
+```
+/storage                              → see R2 usage
+/delete abc123def456abc123def456abc   → delete specific file
+/clear                                → asks confirmation
+/confirmclear                         → deletes everything
+```
 
 ---
 
-## File Size Limits
+## Free Tier Limits Summary
 
-| Method        | Max Size |
-|---------------|----------|
-| Bot API       | 20 MB ❌  |
-| MTProto (this)| **4 GB** ✅ |
+| Service | Limit |
+|---|---|
+| CF Worker requests | 100,000/day |
+| R2 storage | 10 GB total |
+| R2 reads | 1,000,000/month |
+| R2 writes | 1,000,000/month |
+| R2 **bandwidth** | ♾️ **Unlimited — $0 forever** |
+| D1 reads | 5,000,000/day |
+| D1 writes | 100,000/day |
 
 ---
 
-## Troubleshooting
+## File Structure
 
-| Problem | Fix |
-|---------|-----|
-| Bot not responding | Check Koyeb logs, verify BOT_TOKEN |
-| "File not found" | MongoDB not connected, check DATABASE_URL |
-| CF Worker error | Check KOYEB_URL secret is set correctly |
-| Can't store file | Bot not admin in BIN_CHANNEL |
-| 4 GB file fails | Normal — Telegram itself limits user uploads to 4 GB |
+```
+solution1/
+├── koyeb-bot/
+│   ├── bot.py           ← Python bot (Pyrogram + R2 upload)
+│   ├── config.py        ← All env vars
+│   ├── requirements.txt
+│   └── Dockerfile
+└── cf-worker/
+    ├── src/
+    │   └── index.js     ← CF Worker (downloads + API)
+    ├── schema.sql        ← D1 database schema
+    ├── wrangler.toml     ← CF config
+    └── package.json
+```
