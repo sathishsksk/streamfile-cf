@@ -33,7 +33,7 @@ db    = mongo["filebot"]
 # Each client handles ONE stream_media at a time.
 # POOL_SIZE = 3 means 3 simultaneous downloads without any blocking.
 # Increase if you get many concurrent users. Each client uses ~10MB RAM.
-POOL_SIZE  = 20
+POOL_SIZE  = 8
 CHUNK_SIZE = 1024 * 1024
 
 # ── Main bot — handles all messages/commands ──────────────────────────────────
