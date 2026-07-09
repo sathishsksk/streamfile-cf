@@ -1,16 +1,16 @@
 /**
  * File-To-Link  ─  Cloudflare Worker (Frontend)
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CHANGED: URL format now /{bin_msg_id}/{filename}?hash=...
+ *
  * Routes:
- *   GET /           → status page
- *   GET /file/{token} → beautiful download page
- *   GET /dl/{token}   → proxies stream from Koyeb Python server
+ *   GET /              → status page
+ *   GET /file/{id}/{name}?hash=  → beautiful download page
+ *   GET /dl/{id}/{name}?hash=    → proxies stream from Koyeb Python server
  *
  * env secrets needed:
  *   KOYEB_URL  = https://your-app.koyeb.app   (no trailing slash)
  */
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtSize(b) {
   if (!b) return "Unknown";
@@ -22,8 +22,8 @@ function fmtSize(b) {
 
 // ── Pages ─────────────────────────────────────────────────────────────────────
 
-function downloadPage(info, token, workerUrl) {
-  const dlUrl   = `${workerUrl}/dl/${token}`;
+function downloadPage(info, binMsgId, filename, hash, workerUrl) {
+  const dlUrl   = `${workerUrl}/dl/${binMsgId}/${encodeURIComponent(filename)}?hash=${hash}`;
   const { file_name, file_size, mime_type } = info;
 
   return `<!DOCTYPE html>
@@ -167,26 +167,22 @@ ${detail ? `<p>${detail}</p>` : ""}
 </div></body></html>`;
 }
 
-// ── Route: /dl/{token} — proxies stream from Koyeb ───────────────────────────
+// ── Route: GET /dl/{binMsgId}/{filename}?hash=  ───────────────────────────────
+// Proxies stream from Koyeb /stream/{binMsgId}
 
-async function handleDownload(env, token, request) {
-  const koyebStream = `${env.KOYEB_URL}/stream/${token}`;
+async function handleDownload(env, binMsgId, request) {
+  const koyebStream = `${env.KOYEB_URL}/stream/${binMsgId}`;
 
-  // Forward Range header (for video seeking / resumable download)
   const rangeHeader = request.headers.get("Range");
   const reqHeaders  = { "User-Agent": "CloudflareWorker/1.0" };
   if (rangeHeader) reqHeaders["Range"] = rangeHeader;
 
   let upstream;
   try {
-    upstream = await fetch(koyebStream, {
-      method: "GET",
-      headers: reqHeaders,
-      // CF will stream — don't buffer entire response
-    });
+    upstream = await fetch(koyebStream, { method: "GET", headers: reqHeaders });
   } catch (err) {
     return new Response(
-      errorPage("Server Unreachable", "The Koyeb Python server could not be reached. It may be starting up — try again in 10 seconds."),
+      errorPage("Server Unreachable", "The Koyeb server could not be reached. Try again in 10 seconds."),
       { status: 502, headers: { "Content-Type": "text/html;charset=utf-8" } }
     );
   }
@@ -205,24 +201,20 @@ async function handleDownload(env, token, request) {
     );
   }
 
-  // Pass through headers from Koyeb (Content-Type, Content-Disposition, etc.)
   const headers = new Headers(upstream.headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Cache-Control", "public, max-age=3600");
 
-  return new Response(upstream.body, {
-    status : upstream.status,
-    headers,
-  });
+  return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-// ── Route: /file/{token} — HTML download page ─────────────────────────────────
+// ── Route: GET /file/{binMsgId}/{filename}?hash=  ─────────────────────────────
+// HTML download page — fetches metadata from Koyeb /info/{binMsgId}
 
-async function handleFilePage(env, token, workerUrl) {
-  // Fetch file metadata from Koyeb /info/{token}
+async function handleFilePage(env, binMsgId, filename, hash, workerUrl) {
   let info;
   try {
-    const res = await fetch(`${env.KOYEB_URL}/info/${token}`);
+    const res = await fetch(`${env.KOYEB_URL}/info/${binMsgId}`);
     if (!res.ok) throw new Error(`status ${res.status}`);
     info = await res.json();
   } catch (e) {
@@ -232,7 +224,7 @@ async function handleFilePage(env, token, workerUrl) {
     );
   }
 
-  return new Response(downloadPage(info, token, workerUrl), {
+  return new Response(downloadPage(info, binMsgId, filename, hash, workerUrl), {
     headers: { "Content-Type": "text/html;charset=utf-8" },
   });
 }
@@ -245,14 +237,21 @@ export default {
     const path      = url.pathname;
     const workerUrl = `${url.protocol}//${url.host}`;
 
-    // GET /dl/{token}
+    // GET /dl/{binMsgId}/{filename}?hash=...
+    // e.g. /dl/63441/Filename+%282026%29.mkv?hash=AgADwx
     if (request.method === "GET" && path.startsWith("/dl/")) {
-      return handleDownload(env, path.slice(4), request);
+      const parts     = path.slice(4).split("/");   // ["63441", "Filename+...mkv"]
+      const binMsgId  = parts[0];
+      return handleDownload(env, binMsgId, request);
     }
 
-    // GET /file/{token}
+    // GET /file/{binMsgId}/{filename}?hash=...
     if (request.method === "GET" && path.startsWith("/file/")) {
-      return handleFilePage(env, path.slice(6), workerUrl);
+      const parts    = path.slice(6).split("/");    // ["63441", "Filename+...mkv"]
+      const binMsgId = parts[0];
+      const filename = decodeURIComponent(parts.slice(1).join("/") || "file");
+      const hash     = url.searchParams.get("hash") || "";
+      return handleFilePage(env, binMsgId, filename, hash, workerUrl);
     }
 
     // GET /
