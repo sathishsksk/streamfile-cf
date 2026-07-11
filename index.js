@@ -1,15 +1,11 @@
 /**
- * File-To-Link  ─  Cloudflare Worker (Frontend)
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * CHANGED: URL format now /{bin_msg_id}/{filename}?hash=...
- *
+ * File-To-Link — Cloudflare Worker
  * Routes:
  *   GET /              → status page
- *   GET /file/{id}/{name}?hash=  → beautiful download page
- *   GET /dl/{id}/{name}?hash=    → proxies stream from Koyeb Python server
+ *   GET /file/{id}/{name}?hash=  → download page HTML
+ *   GET /dl/{id}/{name}?hash=    → proxies to Koyeb /stream/{id}?hash=
  *
- * env secrets needed:
- *   KOYEB_URL  = https://your-app.koyeb.app   (no trailing slash)
+ * env: KOYEB_URL = https://your-app.koyeb.app  (no trailing slash)
  */
 
 function fmtSize(b) {
@@ -20,113 +16,59 @@ function fmtSize(b) {
   return `${b.toFixed(1)} ${u[i]}`;
 }
 
-// ── Pages ─────────────────────────────────────────────────────────────────────
-
+// ── Download page ─────────────────────────────────────────────────────────────
 function downloadPage(info, binMsgId, filename, hash, workerUrl) {
-  const dlUrl   = `${workerUrl}/dl/${binMsgId}/${encodeURIComponent(filename)}?hash=${hash}`;
-  const { file_name, file_size, mime_type } = info;
-
+  const dlUrl = `${workerUrl}/dl/${binMsgId}/${encodeURIComponent(filename)}?hash=${hash}`;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>${file_name}</title>
+  <title>${info.file_name || filename}</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
-    body {
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      background: #0a0a0f;
-      color: #e2e8f0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .card {
-      background: linear-gradient(145deg, #141420, #1a1a2e);
-      border: 1px solid #2a2a45;
-      border-radius: 20px;
-      padding: 44px 36px;
-      max-width: 540px;
-      width: 100%;
-      text-align: center;
-      box-shadow: 0 24px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04);
-    }
-    .icon { font-size: 64px; margin-bottom: 20px; display: block; }
-    .name {
-      font-size: 1.25rem;
-      font-weight: 700;
-      color: #f1f5f9;
-      word-break: break-all;
-      margin-bottom: 10px;
-      line-height: 1.4;
-    }
-    .meta {
-      display: flex;
-      gap: 12px;
-      justify-content: center;
-      flex-wrap: wrap;
-      margin-bottom: 32px;
-    }
-    .badge {
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 999px;
-      padding: 4px 14px;
-      font-size: 0.78rem;
-      color: #94a3b8;
-    }
-    .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 14px 28px;
-      border-radius: 12px;
-      font-size: 0.95rem;
-      font-weight: 600;
-      text-decoration: none;
-      transition: transform .15s, box-shadow .15s;
-      cursor: pointer;
-    }
-    .btn:hover { transform: translateY(-2px); }
-    .btn-dl {
-      background: linear-gradient(135deg, #0ea5e9, #0284c7);
-      color: #fff;
-      box-shadow: 0 4px 20px rgba(14,165,233,.35);
-    }
-    .btn-dl:hover { box-shadow: 0 8px 30px rgba(14,165,233,.5); }
-    .btn-stream {
-      background: linear-gradient(135deg, #22c55e, #16a34a);
-      color: #fff;
-      box-shadow: 0 4px 20px rgba(34,197,94,.3);
-    }
-    .btn-stream:hover { box-shadow: 0 8px 30px rgba(34,197,94,.5); }
-    .footer {
-      margin-top: 28px;
-      font-size: 0.72rem;
-      color: #475569;
-    }
-    .footer span { color: #0ea5e9; }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0a0f;
+    color:#e2e8f0;min-height:100vh;display:flex;align-items:center;
+    justify-content:center;padding:20px}
+    .card{background:linear-gradient(145deg,#141420,#1a1a2e);
+    border:1px solid #2a2a45;border-radius:20px;padding:44px 36px;
+    max-width:540px;width:100%;text-align:center;
+    box-shadow:0 24px 80px rgba(0,0,0,.6)}
+    .icon{font-size:64px;margin-bottom:20px;display:block}
+    .name{font-size:1.2rem;font-weight:700;color:#f1f5f9;
+    word-break:break-all;margin-bottom:10px;line-height:1.4}
+    .meta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:32px}
+    .badge{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);
+    border-radius:999px;padding:4px 14px;font-size:.78rem;color:#94a3b8}
+    .actions{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+    .btn{display:inline-flex;align-items:center;gap:8px;padding:14px 28px;
+    border-radius:12px;font-size:.95rem;font-weight:600;text-decoration:none;
+    transition:transform .15s,box-shadow .15s}
+    .btn:hover{transform:translateY(-2px)}
+    .btn-dl{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;
+    box-shadow:0 4px 20px rgba(14,165,233,.35)}
+    .btn-dl:hover{box-shadow:0 8px 30px rgba(14,165,233,.5)}
+    .btn-stream{background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;
+    box-shadow:0 4px 20px rgba(34,197,94,.3)}
+    .btn-stream:hover{box-shadow:0 8px 30px rgba(34,197,94,.5)}
+    .footer{margin-top:28px;font-size:.72rem;color:#475569}
+    .footer span{color:#0ea5e9}
   </style>
 </head>
 <body>
 <div class="card">
   <span class="icon">📁</span>
-  <div class="name">${file_name}</div>
+  <div class="name">${info.file_name || filename}</div>
   <div class="meta">
-    <span class="badge">📦 ${fmtSize(file_size)}</span>
-    <span class="badge">🏷️ ${mime_type || "unknown"}</span>
+    <span class="badge">📦 ${fmtSize(info.file_size)}</span>
+    <span class="badge">🏷️ ${info.mime_type || "file"}</span>
   </div>
   <div class="actions">
-    <a class="btn btn-dl"     href="${dlUrl}" download="${file_name}">⬇️ Download</a>
+    <a class="btn btn-dl"     href="${dlUrl}" download="${info.file_name || filename}">⬇️ Download</a>
     <a class="btn btn-stream" href="${dlUrl}" target="_blank">▶️ Stream</a>
   </div>
   <div class="footer">
     Powered by <span>Cloudflare Workers</span> + <span>Pyrogram MTProto</span>
-    · Up to 4 GB supported
   </div>
 </div>
 </body>
@@ -146,32 +88,14 @@ p{color:#64748b;margin-bottom:8px}
 <body><div class="b">
 <h1>📁 File To Link</h1>
 <p>Telegram file → direct download link</p>
-<p style="font-size:.8rem;color:#475569">Supports files up to 4 GB · Pyrogram MTProto</p>
 <div class="status">✅ Cloudflare Worker is running</div>
 </div></body></html>`;
 }
 
-function errorPage(msg, detail = "") {
-  return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Error</title>
-<style>body{background:#0a0a0f;color:#e2e8f0;font-family:sans-serif;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:20px}
-.b{text-align:center;max-width:460px;background:#141420;border:1px solid #2a2a45;
-border-radius:16px;padding:36px}
-h2{color:#f87171;margin-bottom:12px}p{color:#94a3b8;line-height:1.6}
-small{color:#475569;font-size:.75rem}</style></head>
-<body><div class="b">
-<h2>❌ ${msg}</h2>
-${detail ? `<p>${detail}</p>` : ""}
-<small>If you think this is an error, try again later.</small>
-</div></body></html>`;
-}
-
-// ── Route: GET /dl/{binMsgId}/{filename}?hash=  ───────────────────────────────
-// Proxies stream from Koyeb /stream/{binMsgId}
-
-async function handleDownload(env, binMsgId, request) {
-  const koyebStream = `${env.KOYEB_URL}/stream/${binMsgId}`;
+// ── Route: GET /dl/{binMsgId}/{filename}?hash= ────────────────────────────────
+// Proxy to Koyeb /stream/{binMsgId}?hash=  (hash has encoded file_id inside)
+async function handleDownload(env, binMsgId, filename, hash, request) {
+  const koyebUrl = `${env.KOYEB_URL}/stream/${binMsgId}?hash=${encodeURIComponent(hash)}`;
 
   const rangeHeader = request.headers.get("Range");
   const reqHeaders  = { "User-Agent": "CloudflareWorker/1.0" };
@@ -179,49 +103,45 @@ async function handleDownload(env, binMsgId, request) {
 
   let upstream;
   try {
-    upstream = await fetch(koyebStream, { method: "GET", headers: reqHeaders });
+    upstream = await fetch(koyebUrl, { method: "GET", headers: reqHeaders });
   } catch (err) {
-    return new Response(
-      errorPage("Server Unreachable", "The Koyeb server could not be reached. Try again in 10 seconds."),
-      { status: 502, headers: { "Content-Type": "text/html;charset=utf-8" } }
-    );
-  }
-
-  if (upstream.status === 404) {
-    return new Response(
-      errorPage("File Not Found", "This link may have expired or the file was removed."),
-      { status: 404, headers: { "Content-Type": "text/html;charset=utf-8" } }
-    );
+    return new Response("Koyeb server unreachable. Try again in a moment.", {
+      status: 502,
+      headers: { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" },
+    });
   }
 
   if (!upstream.ok && upstream.status !== 206) {
-    return new Response(
-      errorPage("Download Failed", `Server returned status ${upstream.status}.`),
-      { status: upstream.status, headers: { "Content-Type": "text/html;charset=utf-8" } }
-    );
+    const body = await upstream.text().catch(() => "");
+    return new Response(`Download failed (${upstream.status}): ${body}`, {
+      status: upstream.status,
+      headers: { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" },
+    });
   }
 
   const headers = new Headers(upstream.headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Cache-Control", "public, max-age=3600");
+  // Ensure browser downloads instead of navigating
+  if (!headers.get("Content-Disposition")) {
+    headers.set("Content-Disposition", `attachment; filename="${decodeURIComponent(filename)}"`);
+  }
 
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-// ── Route: GET /file/{binMsgId}/{filename}?hash=  ─────────────────────────────
-// HTML download page — fetches metadata from Koyeb /info/{binMsgId}
-
+// ── Route: GET /file/{binMsgId}/{filename}?hash= ──────────────────────────────
+// Show HTML download page — fetch metadata from Koyeb /info/{binMsgId}?hash=
 async function handleFilePage(env, binMsgId, filename, hash, workerUrl) {
-  let info;
+  let info = { file_name: filename, file_size: 0, mime_type: "file" };
   try {
-    const res = await fetch(`${env.KOYEB_URL}/info/${binMsgId}`);
-    if (!res.ok) throw new Error(`status ${res.status}`);
-    info = await res.json();
-  } catch (e) {
-    return new Response(
-      errorPage("File Not Found", "This link may have expired or the file was removed."),
-      { status: 404, headers: { "Content-Type": "text/html;charset=utf-8" } }
+    const res = await fetch(
+      `${env.KOYEB_URL}/info/${binMsgId}?hash=${encodeURIComponent(hash)}`,
+      { headers: { "User-Agent": "CloudflareWorker/1.0" } }
     );
+    if (res.ok) info = await res.json();
+  } catch (e) {
+    // Use defaults — page still shows
   }
 
   return new Response(downloadPage(info, binMsgId, filename, hash, workerUrl), {
@@ -229,28 +149,27 @@ async function handleFilePage(env, binMsgId, filename, hash, workerUrl) {
   });
 }
 
-// ── Main Entry ────────────────────────────────────────────────────────────────
-
+// ── Main entry ────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const url       = new URL(request.url);
     const path      = url.pathname;
     const workerUrl = `${url.protocol}//${url.host}`;
+    const hash      = url.searchParams.get("hash") || "";
 
-    // GET /dl/{binMsgId}/{filename}?hash=...
-    // e.g. /dl/63441/Filename+%282026%29.mkv?hash=AgADwx
+    // GET /dl/{binMsgId}/{filename}?hash=
     if (request.method === "GET" && path.startsWith("/dl/")) {
-      const parts     = path.slice(4).split("/");   // ["63441", "Filename+...mkv"]
-      const binMsgId  = parts[0];
-      return handleDownload(env, binMsgId, request);
-    }
-
-    // GET /file/{binMsgId}/{filename}?hash=...
-    if (request.method === "GET" && path.startsWith("/file/")) {
-      const parts    = path.slice(6).split("/");    // ["63441", "Filename+...mkv"]
+      const parts    = path.slice(4).split("/");
       const binMsgId = parts[0];
       const filename = decodeURIComponent(parts.slice(1).join("/") || "file");
-      const hash     = url.searchParams.get("hash") || "";
+      return handleDownload(env, binMsgId, filename, hash, request);
+    }
+
+    // GET /file/{binMsgId}/{filename}?hash=
+    if (request.method === "GET" && path.startsWith("/file/")) {
+      const parts    = path.slice(6).split("/");
+      const binMsgId = parts[0];
+      const filename = decodeURIComponent(parts.slice(1).join("/") || "file");
       return handleFilePage(env, binMsgId, filename, hash, workerUrl);
     }
 

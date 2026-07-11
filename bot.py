@@ -1,17 +1,10 @@
 """
-File-To-Link Bot — Koyeb + Cloudflare Edition
-Supports files up to 4 GB via Pyrogram MTProto
-
-CHANGES FROM ORIGINAL:
-  1. build_links() → new URL format /{bin_msg_id}/{filename}?hash=file_unique_id
-  2. process_and_reply() → sends bin channel notification with requester details
-  3. stream_handler → looks up file by bin_msg_id (not token)
-  4. info_handler   → looks up file by bin_msg_id (not token)
-
-Everything else is identical to the original.
+File-To-Link Bot — No-DB streaming version
+Files stream directly using file_id encoded in the URL hash.
+MongoDB only used for user tracking (non-critical, fails silently).
 """
 
-import re, time, asyncio, logging, hashlib, mimetypes
+import re, time, asyncio, logging, hashlib, mimetypes, base64, json
 from itertools import cycle
 from datetime import datetime
 from urllib.parse import quote
@@ -26,8 +19,20 @@ from config import Config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("FileBot")
 
-mongo = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
-db    = mongo["filebot"]
+# MongoDB — optional, fails silently if unavailable
+try:
+    mongo = motor.motor_asyncio.AsyncIOMotorClient(
+        Config.DATABASE_URL,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000,
+    )
+    db = mongo["filebot"]
+    MONGO_OK = True
+except Exception as e:
+    log.warning(f"MongoDB init failed (non-critical): {e}")
+    db = None
+    MONGO_OK = False
 
 CHUNK_SIZE = 1024 * 1024
 POOL_SIZE  = 8
@@ -47,7 +52,7 @@ _pool_cycle = None
 async def init_stream_pool():
     global _pool_cycle
     if not Config.STRING_SESSION:
-        log.warning("⚠️  STRING_SESSION not set — stream pool disabled, using single client")
+        log.warning("⚠️  STRING_SESSION not set — using single client")
         stream_pool.append(bot)
         _pool_cycle = cycle(stream_pool)
         return
@@ -65,13 +70,9 @@ async def init_stream_pool():
     log.info(f"✅ Stream pool ready — {POOL_SIZE} concurrent downloads")
 
 def next_client() -> Client:
-    if _pool_cycle:
-        return next(_pool_cycle)
-    return bot
+    return next(_pool_cycle) if _pool_cycle else bot
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def fmt_size(b):
     if not b: return "Unknown"
@@ -102,71 +103,71 @@ def get_media_info(msg: Message):
                            or "application/octet-stream",
     }
 
-def make_token(fid):
-    return hashlib.sha256(fid.encode()).hexdigest()[:32]
+# ── NO-DB approach: encode file_id + mime in the hash param ──────────────────
+# hash = base64url( json({fid, mime, size}) )
 
-# ── CHANGED: new URL format /{bin_msg_id}/{filename}?hash={file_unique_id} ────
-def build_links(bin_msg_id: int, file_name: str, file_unique_id: str):
+def encode_hash(file_id: str, mime_type: str, file_size: int) -> str:
+    payload = json.dumps({"f": file_id, "m": mime_type, "s": file_size})
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+def decode_hash(h: str) -> dict | None:
+    try:
+        padding = 4 - len(h) % 4
+        if padding != 4: h += "=" * padding
+        return json.loads(base64.urlsafe_b64decode(h).decode())
+    except Exception:
+        return None
+
+def build_links(bin_msg_id: int, file_name: str, file_id: str,
+                mime_type: str, file_size: int):
     base     = Config.CF_WORKER_URL
     encoded  = quote(file_name, safe="")
-    hash_val = file_unique_id
-    dl   = f"{base}/dl/{bin_msg_id}/{encoded}?hash={hash_val}"
-    page = f"{base}/file/{bin_msg_id}/{encoded}?hash={hash_val}"
+    h        = encode_hash(file_id, mime_type, file_size)
+    dl   = f"{base}/dl/{bin_msg_id}/{encoded}?hash={h}"
+    page = f"{base}/file/{bin_msg_id}/{encoded}?hash={h}"
     return dl, page
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DATABASE
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def save_file(info, bin_msg_id):
-    token = make_token(info["file_id"])
-    await db["files"].update_one(
-        {"bin_msg_id": bin_msg_id},
-        {"$set": {
-            **info,
-            "token"      : token,
-            "bin_msg_id" : bin_msg_id,
-            "updated_at" : datetime.utcnow(),
-        }},
-        upsert=True,
-    )
-    return token
-
-# CHANGED: look up by bin_msg_id (stream/info handlers use this)
-async def get_file_by_bin_id(bin_msg_id: int):
-    return await db["files"].find_one({"bin_msg_id": bin_msg_id}, {"_id": 0})
-
-# Keep token lookup for backward compatibility with old links
-async def get_file(token):
-    return await db["files"].find_one({"token": token}, {"_id": 0})
+# ── MongoDB helpers (fail silently) ──────────────────────────────────────────
 
 async def save_user(uid, name):
-    await db["users"].update_one({"uid": uid},
-        {"$set": {"name": name, "last": datetime.utcnow()},
-         "$setOnInsert": {"joined": datetime.utcnow()}},
-        upsert=True)
+    if not db: return
+    try:
+        await db["users"].update_one(
+            {"uid": uid},
+            {"$set": {"name": name, "last": datetime.utcnow()},
+             "$setOnInsert": {"joined": datetime.utcnow()}},
+            upsert=True
+        )
+    except Exception as e:
+        log.warning(f"save_user failed (non-critical): {e}")
 
 async def is_verified(uid):
     if not Config.MY_PASS: return True
-    return bool(await db["auth"].find_one({"uid": uid}))
+    if not db: return True
+    try:
+        return bool(await db["auth"].find_one({"uid": uid}))
+    except Exception:
+        return True
 
 async def is_pending(uid):
-    return bool(await db["pending"].find_one({"uid": uid}))
+    if not db: return False
+    try:
+        return bool(await db["pending"].find_one({"uid": uid}))
+    except Exception:
+        return False
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SHARED FILE PROCESSOR
-# ══════════════════════════════════════════════════════════════════════════════
+# ── File processor ────────────────────────────────────────────────────────────
 
 async def process_and_reply(client, msg: Message):
     info = get_media_info(msg)
     if not info: return
 
-    from_user  = msg.from_user
-    user_name  = " ".join(filter(None, [
+    from_user = msg.from_user
+    user_name = " ".join(filter(None, [
         getattr(from_user, "first_name", ""),
         getattr(from_user, "last_name", ""),
     ])) or getattr(from_user, "username", "") or str(getattr(from_user, "id", "Unknown"))
-    user_id    = getattr(from_user, "id", "Unknown")
+    user_id = getattr(from_user, "id", "Unknown")
 
     proc = await msg.reply_text(
         "⏳ <b>Processing your file…</b>",
@@ -184,17 +185,22 @@ async def process_and_reply(client, msg: Message):
         )
         return
 
+    # Use bin channel file_id for streaming (most stable)
     bin_info = get_media_info(fwd)
     if bin_info:
-        info["file_id"]        = bin_info["file_id"]
-        info["file_unique_id"] = bin_info["file_unique_id"]
+        info["file_id"]  = bin_info["file_id"]
+        info["mime_type"] = bin_info.get("mime_type") or info["mime_type"]
 
-    await save_file(info, fwd.id)
+    # Build links with encoded file_id — no DB needed for streaming
+    dl, page = build_links(
+        fwd.id,
+        info["file_name"],
+        info["file_id"],
+        info["mime_type"],
+        info["file_size"],
+    )
 
-    # ── CHANGED: new URL format ───────────────────────────────────────────────
-    dl, page = build_links(fwd.id, info["file_name"], info["file_unique_id"])
-
-    # ── ADDED: bin channel notification with requester details ────────────────
+    # Bin channel notification
     try:
         await client.send_message(
             Config.BIN_CHANNEL,
@@ -210,9 +216,8 @@ async def process_and_reply(client, msg: Message):
             reply_to_message_id=fwd.id,
         )
     except Exception as e:
-        log.warning(f"Bin channel notify failed: {e}")
+        log.warning(f"Bin notify failed: {e}")
 
-    # ── Reply to user ─────────────────────────────────────────────────────────
     await proc.edit_text(
         f"✅ <b>Link Ready!</b>\n\n"
         f"📄 <b>File:</b> <code>{info['file_name']}</code>\n"
@@ -227,9 +232,7 @@ async def process_and_reply(client, msg: Message):
         ]]),
     )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BOT HANDLERS  (identical to original)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Bot handlers ──────────────────────────────────────────────────────────────
 
 @bot.on_message(filters.command("start") & (filters.private | filters.group))
 async def cmd_start(_, msg: Message):
@@ -244,8 +247,7 @@ async def cmd_start(_, msg: Message):
         f"👋 <b>Hello {msg.from_user.first_name}!</b>\n\n"
         "📁 <b>File To Link Bot</b>\n"
         "Send any file up to <b>4 GB</b> — get an instant direct download link!\n\n"
-        "⚡ Powered by Pyrogram MTProto + Cloudflare CDN\n\n"
-        "<b>Works in:</b> Private chats, Groups, Channels",
+        "⚡ Powered by Pyrogram MTProto + Cloudflare CDN",
         parse_mode=enums.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(btns) if btns else None,
     )
@@ -257,8 +259,7 @@ async def cmd_help(_, msg: Message):
         "/start — Welcome message\n"
         "/help  — This message\n"
         "/ping  — Check bot speed\n\n"
-        "Send any <b>file, video, audio, photo</b> to get a download link!\n\n"
-        "<b>Supported:</b> Private chats ✅ Groups ✅ Channels ✅",
+        "Send any <b>file, video, audio, photo</b> to get a download link!",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -268,8 +269,7 @@ async def cmd_ping(_, msg: Message):
     m = await msg.reply_text("🏓 Pinging…")
     ms = round((time.time()-t)*1000)
     await m.edit_text(
-        f"🏓 <b>Pong!</b>  <code>{ms}ms</code>\n"
-        "🐍 Pyrogram on Koyeb + ⚡ Cloudflare Worker",
+        f"🏓 <b>Pong!</b>  <code>{ms}ms</code>",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -282,7 +282,8 @@ async def handle_private_file(client, msg: Message):
     await save_user(msg.from_user.id, msg.from_user.first_name)
     if not await is_verified(msg.from_user.id):
         await db["pending"].update_one(
-            {"uid": msg.from_user.id}, {"$set": {"uid": msg.from_user.id}}, upsert=True)
+            {"uid": msg.from_user.id},
+            {"$set": {"uid": msg.from_user.id}}, upsert=True)
         await msg.reply_text(
             "🔒 <b>Bot is password protected.</b>\n\nSend the password to continue.",
             parse_mode=enums.ParseMode.HTML)
@@ -305,16 +306,17 @@ async def handle_text(_, msg: Message):
     if not Config.MY_PASS: return
     if not await is_pending(msg.from_user.id): return
     if msg.text == Config.MY_PASS:
-        await db["auth"].update_one(
-            {"uid": msg.from_user.id}, {"$set": {"uid": msg.from_user.id}}, upsert=True)
-        await db["pending"].delete_one({"uid": msg.from_user.id})
-        await msg.reply_text(
-            "✅ <b>Password correct! Now send your file.</b>",
-            parse_mode=enums.ParseMode.HTML)
+        try:
+            await db["auth"].update_one(
+                {"uid": msg.from_user.id},
+                {"$set": {"uid": msg.from_user.id}}, upsert=True)
+            await db["pending"].delete_one({"uid": msg.from_user.id})
+        except Exception: pass
+        await msg.reply_text("✅ <b>Password correct! Now send your file.</b>",
+                             parse_mode=enums.ParseMode.HTML)
     else:
-        await msg.reply_text(
-            "❌ <b>Wrong password.</b> Try again.",
-            parse_mode=enums.ParseMode.HTML)
+        await msg.reply_text("❌ <b>Wrong password.</b> Try again.",
+                             parse_mode=enums.ParseMode.HTML)
 
 @bot.on_message(
     filters.channel &
@@ -328,10 +330,12 @@ async def handle_channel(client, msg: Message):
         fwd = await client.copy_message(Config.BIN_CHANNEL, msg.chat.id, msg.id)
         bin_info = get_media_info(fwd)
         if bin_info:
-            info["file_id"]        = bin_info["file_id"]
-            info["file_unique_id"] = bin_info["file_unique_id"]
-        await save_file(info, fwd.id)
-        dl, page = build_links(fwd.id, info["file_name"], info["file_unique_id"])
+            info["file_id"]   = bin_info["file_id"]
+            info["mime_type"] = bin_info.get("mime_type") or info["mime_type"]
+        dl, page = build_links(
+            fwd.id, info["file_name"],
+            info["file_id"], info["mime_type"], info["file_size"]
+        )
         await client.edit_message_reply_markup(
             msg.chat.id, msg.id,
             reply_markup=InlineKeyboardMarkup([[
@@ -342,31 +346,23 @@ async def handle_channel(client, msg: Message):
     except Exception as e:
         log.error(f"Channel error: {e}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# WEB SERVER
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Web server ────────────────────────────────────────────────────────────────
 
 async def stream_handler(request: web.Request):
     """
-    GET /stream/{binMsgId}
-
-    CHANGED: looks up file by bin_msg_id instead of token.
-    Everything else identical to original.
+    GET /stream/{binMsgId}?hash=<encoded>
+    Decodes file_id directly from hash — NO MongoDB lookup needed.
     """
-    bin_msg_id = request.match_info["bin_msg_id"]
-    try:
-        bid = int(bin_msg_id)
-    except ValueError:
-        return web.Response(status=400, text="Invalid ID")
+    h = request.rel_url.query.get("hash", "")
+    payload = decode_hash(h) if h else None
 
-    info = await get_file_by_bin_id(bid)
-    if not info:
-        return web.Response(status=404, text="File not found")
+    if not payload or not payload.get("f"):
+        return web.Response(status=404, text="File not found — invalid or missing hash")
 
-    file_id   = info["file_id"]
-    file_size = info.get("file_size", 0)
-    mime      = info.get("mime_type", "application/octet-stream")
-    file_name = info.get("file_name", "file")
+    file_id   = payload["f"]
+    file_size = payload.get("s", 0)
+    mime      = payload.get("m", "application/octet-stream")
+    file_name = request.match_info.get("file_name", "file")
 
     range_hdr  = request.headers.get("Range", "")
     byte_start = 0
@@ -380,20 +376,20 @@ async def stream_handler(request: web.Request):
     chunk_index = byte_start // CHUNK_SIZE
     skip_bytes  = byte_start % CHUNK_SIZE
 
-    media_iter  = next_client().stream_media(file_id, offset=chunk_index).__aiter__()
-    first_chunk = None
+    client      = next_client()
+    media_iter  = client.stream_media(file_id, offset=chunk_index).__aiter__()
+    first_chunk = b""
+
     try:
         raw         = await media_iter.__anext__()
         first_chunk = raw[skip_bytes:]
     except FloodWait as e:
-        log.warning(f"[FloodWait] {bin_msg_id} — {e.value}s")
         return web.Response(
-            status  = 503,
-            text    = f"Telegram rate limit. Retry in {e.value} seconds.",
-            headers = {"Retry-After": str(e.value), "Access-Control-Allow-Origin": "*"},
+            status=503, text=f"Rate limited. Retry in {e.value}s",
+            headers={"Retry-After": str(e.value), "Access-Control-Allow-Origin": "*"},
         )
     except FileIdInvalid:
-        return web.Response(status=410, text="File ID no longer valid.")
+        return web.Response(status=410, text="File ID expired.")
     except StopAsyncIteration:
         first_chunk = b""
     except Exception as e:
@@ -420,32 +416,29 @@ async def stream_handler(request: web.Request):
         return response
 
     remaining = (byte_end - byte_start + 1) if file_size else None
-    if first_chunk:
-        chunk = first_chunk
+
+    async def write_chunk(chunk):
+        nonlocal remaining
         if remaining is not None:
+            if remaining <= 0: return False
             if len(chunk) > remaining: chunk = chunk[:remaining]
             remaining -= len(chunk)
         if chunk:
             try:
                 await response.write(chunk)
             except (ConnectionResetError, ConnectionAbortedError):
-                return response
+                return False
+        return True
+
+    if not await write_chunk(first_chunk):
+        return response
 
     try:
         async for chunk in media_iter:
-            if remaining is not None:
-                if remaining <= 0: break
-                if len(chunk) > remaining: chunk = chunk[:remaining]
-                remaining -= len(chunk)
-            if chunk:
-                await response.write(chunk)
+            if not await write_chunk(chunk): break
             if remaining is not None and remaining <= 0: break
     except (ConnectionResetError, ConnectionAbortedError):
         pass
-    except FloodWait as e:
-        log.warning(f"[FloodWait mid-stream] {bin_msg_id} — {e.value}s")
-    except FileIdInvalid:
-        log.error(f"FileIdInvalid mid-stream: {bin_msg_id}")
     except Exception as e:
         log.error(f"Stream error: {e}")
 
@@ -456,22 +449,16 @@ async def stream_handler(request: web.Request):
     return response
 
 async def info_handler(request: web.Request):
-    """
-    GET /info/{binMsgId}
-    CHANGED: looks up by bin_msg_id instead of token.
-    """
-    try:
-        bid = int(request.match_info["bin_msg_id"])
-    except ValueError:
-        return web.json_response({"error": "invalid id"}, status=400)
-
-    info = await get_file_by_bin_id(bid)
-    if not info:
+    """GET /info/{binMsgId}?hash=<encoded> — returns file metadata from hash"""
+    h = request.rel_url.query.get("hash", "")
+    payload = decode_hash(h) if h else None
+    if not payload:
         return web.json_response({"error": "not found"}, status=404)
+    file_name = request.match_info.get("file_name", "file")
     return web.json_response({
-        "file_name": info.get("file_name"),
-        "file_size": info.get("file_size"),
-        "mime_type": info.get("mime_type"),
+        "file_name" : file_name,
+        "file_size" : payload.get("s", 0),
+        "mime_type" : payload.get("m", "application/octet-stream"),
     })
 
 async def health_handler(_):
@@ -483,31 +470,19 @@ async def home_handler(_):
 <style>body{background:#0f0f0f;color:#eee;font-family:sans-serif;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 .b{text-align:center}h1{color:#0088cc;font-size:2rem;margin-bottom:12px}
-p{color:#888;margin-bottom:8px}.ok{color:#22c55e;margin-top:16px}
-.badges{display:flex;gap:10px;justify-content:center;margin-top:12px}
-.badge{background:#1a1a2e;border:1px solid #333;border-radius:999px;
-padding:4px 14px;font-size:.75rem;color:#94a3b8}</style></head>
+p{color:#888}.ok{color:#22c55e;margin-top:16px}</style></head>
 <body><div class="b"><h1>📁 File To Link Bot</h1>
-<p>Pyrogram MTProto · 4 GB Support · Concurrent Downloads</p>
-<div class="badges">
-<span class="badge">✅ Private</span>
-<span class="badge">✅ Groups</span>
-<span class="badge">✅ Channels</span>
-</div>
-<div class="ok">🟢 Running on Koyeb + Cloudflare</div>
+<p>Pyrogram MTProto · 4 GB Support</p>
+<div class="ok">🟢 Running</div>
 </div></body></html>""")
 
 def build_web_app():
     a = web.Application()
-    a.router.add_get("/",                    home_handler)
-    a.router.add_get("/health",              health_handler)
-    a.router.add_get("/stream/{bin_msg_id}", stream_handler)  # CHANGED: token→bin_msg_id
-    a.router.add_get("/info/{bin_msg_id}",   info_handler)    # CHANGED: token→bin_msg_id
+    a.router.add_get("/",                              home_handler)
+    a.router.add_get("/health",                        health_handler)
+    a.router.add_get("/stream/{bin_msg_id}",           stream_handler)
+    a.router.add_get("/info/{bin_msg_id}",             info_handler)
     return a
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN  (identical to original)
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def start_web_server():
     runner = web.AppRunner(build_web_app())
@@ -516,17 +491,14 @@ async def start_web_server():
     log.info(f"✅ Web server on port {Config.PORT}")
 
 async def main():
-    mode = "✅ String Session" if Config.STRING_SESSION else "⚠️  in_memory (set STRING_SESSION!)"
-    log.info(f"🚀 Starting File-To-Link Bot [{mode}]")
     await bot.start()
     await init_stream_pool()
     asyncio.get_event_loop().create_task(start_web_server())
     me = await bot.get_me()
-    log.info(f"✅ Bot: @{me.username} — {POOL_SIZE} concurrent downloads ready")
+    log.info(f"✅ Bot: @{me.username} ready")
     await idle()
     for c in stream_pool:
-        if c is not bot:
-            await c.stop()
+        if c is not bot: await c.stop()
     await bot.stop()
 
 if __name__ == "__main__":
