@@ -122,10 +122,9 @@ async function handleDownload(env, binMsgId, filename, hash, request) {
   const headers = new Headers(upstream.headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Cache-Control", "public, max-age=3600");
-  // Ensure browser downloads instead of navigating
-  if (!headers.get("Content-Disposition")) {
-    headers.set("Content-Disposition", `attachment; filename="${decodeURIComponent(filename)}"`);
-  }
+  // Always override Content-Disposition with the actual filename from URL
+  headers.set("Content-Disposition", `attachment; filename="${decodeURIComponent(filename)}"`);
+  headers.set("X-File-Name", decodeURIComponent(filename));
 
   return new Response(upstream.body, { status: upstream.status, headers });
 }
