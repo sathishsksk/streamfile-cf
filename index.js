@@ -135,12 +135,16 @@ async function handleFilePage(env, binMsgId, filename, hash, workerUrl) {
   let info = { file_name: filename, file_size: 0, mime_type: "file" };
   try {
     const res = await fetch(
-      `${env.KOYEB_URL}/info/${binMsgId}?hash=${encodeURIComponent(hash)}`,
+      `${env.KOYEB_URL}/info/${binMsgId}?hash=${encodeURIComponent(hash)}&name=${encodeURIComponent(filename)}`,
       { headers: { "User-Agent": "CloudflareWorker/1.0" } }
     );
-    if (res.ok) info = await res.json();
+    if (res.ok) {
+      const data = await res.json();
+      // Always use filename from URL — it's the most accurate
+      info = { ...data, file_name: filename };
+    }
   } catch (e) {
-    // Use defaults — page still shows
+    // Use defaults — page still shows with correct filename
   }
 
   return new Response(downloadPage(info, binMsgId, filename, hash, workerUrl), {
