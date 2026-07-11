@@ -1,7 +1,8 @@
 """
-File-To-Link Bot — No-DB streaming version
-Files stream directly using file_id encoded in the URL hash.
-MongoDB only used for user tracking (non-critical, fails silently).
+File-To-Link Bot — Koyeb + Cloudflare Edition
+Full MongoDB support + No-DB streaming (file_id encoded in URL hash)
+MongoDB used for: user tracking, auth, file metadata logging
+Streaming: works WITHOUT MongoDB — file_id encoded directly in hash param
 """
 
 import re, time, asyncio, logging, hashlib, mimetypes, base64, json
@@ -19,20 +20,9 @@ from config import Config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("FileBot")
 
-# MongoDB — optional, fails silently if unavailable
-try:
-    mongo = motor.motor_asyncio.AsyncIOMotorClient(
-        Config.DATABASE_URL,
-        serverSelectionTimeoutMS=5000,
-        connectTimeoutMS=5000,
-        socketTimeoutMS=5000,
-    )
-    db = mongo["filebot"]
-    MONGO_OK = True
-except Exception as e:
-    log.warning(f"MongoDB init failed (non-critical): {e}")
-    db = None
-    MONGO_OK = False
+# ── MongoDB (full support, fails silently on individual ops if disconnected) ───
+mongo  = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
+db     = mongo["filebot"]
 
 CHUNK_SIZE = 1024 * 1024
 POOL_SIZE  = 8
@@ -76,7 +66,7 @@ def next_client() -> Client:
 
 def fmt_size(b):
     if not b: return "Unknown"
-    for u in ["B","KB","MB","GB"]:
+    for u in ["B", "KB", "MB", "GB"]:
         if b < 1024: return f"{b:.1f} {u}"
         b /= 1024
     return f"{b:.2f} TB"
@@ -87,8 +77,10 @@ def get_media_info(msg: Message):
     if not media: return None
     name = getattr(media, "file_name", None)
     if not name:
-        types = {"video":"mp4","audio":"mp3","voice":"ogg","photo":"jpg",
-                 "sticker":"webp","animation":"gif","video_note":"mp4"}
+        types = {
+            "video": "mp4", "audio": "mp3", "voice": "ogg",
+            "photo": "jpg", "sticker": "webp", "animation": "gif", "video_note": "mp4"
+        }
         for t, ext in types.items():
             if getattr(msg, t, None):
                 name = f"{t}_{msg.id}.{ext}"; break
@@ -98,13 +90,12 @@ def get_media_info(msg: Message):
         "file_unique_id" : media.file_unique_id,
         "file_name"      : name,
         "file_size"      : getattr(media, "file_size", 0) or 0,
-        "mime_type"      : getattr(media, "mime_type", None)
-                           or mimetypes.guess_type(name)[0]
-                           or "application/octet-stream",
+        "mime_type"      : (getattr(media, "mime_type", None)
+                            or mimetypes.guess_type(name)[0]
+                            or "application/octet-stream"),
     }
 
-# ── NO-DB approach: encode file_id + mime in the hash param ──────────────────
-# hash = base64url( json({fid, mime, size}) )
+# ── URL hash: encode file_id + mime + size so streaming needs no DB ───────────
 
 def encode_hash(file_id: str, mime_type: str, file_size: int) -> str:
     payload = json.dumps({"f": file_id, "m": mime_type, "s": file_size})
@@ -112,51 +103,58 @@ def encode_hash(file_id: str, mime_type: str, file_size: int) -> str:
 
 def decode_hash(h: str) -> dict | None:
     try:
-        padding = 4 - len(h) % 4
-        if padding != 4: h += "=" * padding
+        pad = 4 - len(h) % 4
+        if pad != 4: h += "=" * pad
         return json.loads(base64.urlsafe_b64decode(h).decode())
     except Exception:
         return None
 
 def build_links(bin_msg_id: int, file_name: str, file_id: str,
                 mime_type: str, file_size: int):
-    base     = Config.CF_WORKER_URL
-    encoded  = quote(file_name, safe="")
-    h        = encode_hash(file_id, mime_type, file_size)
-    dl   = f"{base}/dl/{bin_msg_id}/{encoded}?hash={h}"
-    page = f"{base}/file/{bin_msg_id}/{encoded}?hash={h}"
+    base    = Config.CF_WORKER_URL.rstrip("/")
+    encoded = quote(file_name, safe="")
+    h       = encode_hash(file_id, mime_type, file_size)
+    dl      = f"{base}/dl/{bin_msg_id}/{encoded}?hash={h}"
+    page    = f"{base}/file/{bin_msg_id}/{encoded}?hash={h}"
     return dl, page
 
-# ── MongoDB helpers (fail silently) ──────────────────────────────────────────
+# ── MongoDB helpers (each wraps in try/except so one failure ≠ crash) ─────────
 
 async def save_user(uid, name):
-    if not db: return
     try:
         await db["users"].update_one(
             {"uid": uid},
-            {"$set": {"name": name, "last": datetime.utcnow()},
+            {"$set":        {"name": name, "last": datetime.utcnow()},
              "$setOnInsert": {"joined": datetime.utcnow()}},
-            upsert=True
+            upsert=True,
         )
     except Exception as e:
         log.warning(f"save_user failed (non-critical): {e}")
 
-async def is_verified(uid):
+async def save_file(info: dict, bin_msg_id: int):
+    try:
+        await db["files"].update_one(
+            {"bin_msg_id": bin_msg_id},
+            {"$set": {**info, "bin_msg_id": bin_msg_id, "updated_at": datetime.utcnow()}},
+            upsert=True,
+        )
+    except Exception as e:
+        log.warning(f"save_file failed (non-critical): {e}")
+
+async def is_verified(uid) -> bool:
     if not Config.MY_PASS: return True
-    if not db: return True
     try:
         return bool(await db["auth"].find_one({"uid": uid}))
     except Exception:
-        return True
+        return True  # fail open if DB unavailable
 
-async def is_pending(uid):
-    if not db: return False
+async def is_pending(uid) -> bool:
     try:
         return bool(await db["pending"].find_one({"uid": uid}))
     except Exception:
         return False
 
-# ── File processor ────────────────────────────────────────────────────────────
+# ── Core file processor ───────────────────────────────────────────────────────
 
 async def process_and_reply(client, msg: Message):
     info = get_media_info(msg)
@@ -165,7 +163,7 @@ async def process_and_reply(client, msg: Message):
     from_user = msg.from_user
     user_name = " ".join(filter(None, [
         getattr(from_user, "first_name", ""),
-        getattr(from_user, "last_name", ""),
+        getattr(from_user, "last_name",  ""),
     ])) or getattr(from_user, "username", "") or str(getattr(from_user, "id", "Unknown"))
     user_id = getattr(from_user, "id", "Unknown")
 
@@ -174,30 +172,32 @@ async def process_and_reply(client, msg: Message):
         parse_mode=enums.ParseMode.HTML,
     )
 
+    # Copy to bin channel to get stable message_id
     try:
         fwd = await client.copy_message(Config.BIN_CHANNEL, msg.chat.id, msg.id)
     except Exception as e:
         log.error(f"copy_message failed: {e}")
         await proc.edit_text(
             "❌ <b>Failed to store file.</b>\n\n"
-            "Make sure the bot is <b>Admin in BIN_CHANNEL</b>.",
+            "Make sure the bot is <b>Admin in BIN_CHANNEL</b> with post permission.",
             parse_mode=enums.ParseMode.HTML,
         )
         return
 
-    # Use bin channel file_id for streaming (most stable)
+    # Use bin channel file_id (more stable for streaming)
     bin_info = get_media_info(fwd)
     if bin_info:
-        info["file_id"]  = bin_info["file_id"]
-        info["mime_type"] = bin_info.get("mime_type") or info["mime_type"]
+        info["file_id"]        = bin_info["file_id"]
+        info["file_unique_id"] = bin_info["file_unique_id"]
+        info["mime_type"]      = bin_info.get("mime_type") or info["mime_type"]
 
-    # Build links with encoded file_id — no DB needed for streaming
+    # Save to MongoDB (non-critical)
+    await save_file(info, fwd.id)
+
+    # Build links (hash encodes file_id — streaming works even if DB is down)
     dl, page = build_links(
-        fwd.id,
-        info["file_name"],
-        info["file_id"],
-        info["mime_type"],
-        info["file_size"],
+        fwd.id, info["file_name"],
+        info["file_id"], info["mime_type"], info["file_size"],
     )
 
     # Bin channel notification
@@ -218,6 +218,7 @@ async def process_and_reply(client, msg: Message):
     except Exception as e:
         log.warning(f"Bin notify failed: {e}")
 
+    # Reply to user
     await proc.edit_text(
         f"✅ <b>Link Ready!</b>\n\n"
         f"📄 <b>File:</b> <code>{info['file_name']}</code>\n"
@@ -240,8 +241,7 @@ async def cmd_start(_, msg: Message):
     btns = []
     if Config.UPDATES_CHANNEL:
         btns.append([InlineKeyboardButton(
-            "📢 Updates Channel",
-            url=f"https://t.me/{Config.UPDATES_CHANNEL}"
+            "📢 Updates Channel", url=f"https://t.me/{Config.UPDATES_CHANNEL}"
         )])
     await msg.reply_text(
         f"👋 <b>Hello {msg.from_user.first_name}!</b>\n\n"
@@ -267,7 +267,7 @@ async def cmd_help(_, msg: Message):
 async def cmd_ping(_, msg: Message):
     t = time.time()
     m = await msg.reply_text("🏓 Pinging…")
-    ms = round((time.time()-t)*1000)
+    ms = round((time.time() - t) * 1000)
     await m.edit_text(
         f"🏓 <b>Pong!</b>  <code>{ms}ms</code>",
         parse_mode=enums.ParseMode.HTML,
@@ -281,12 +281,16 @@ async def cmd_ping(_, msg: Message):
 async def handle_private_file(client, msg: Message):
     await save_user(msg.from_user.id, msg.from_user.first_name)
     if not await is_verified(msg.from_user.id):
-        await db["pending"].update_one(
-            {"uid": msg.from_user.id},
-            {"$set": {"uid": msg.from_user.id}}, upsert=True)
+        try:
+            await db["pending"].update_one(
+                {"uid": msg.from_user.id},
+                {"$set": {"uid": msg.from_user.id}}, upsert=True,
+            )
+        except Exception: pass
         await msg.reply_text(
             "🔒 <b>Bot is password protected.</b>\n\nSend the password to continue.",
-            parse_mode=enums.ParseMode.HTML)
+            parse_mode=enums.ParseMode.HTML,
+        )
         return
     await process_and_reply(client, msg)
 
@@ -300,7 +304,7 @@ async def handle_group_file(client, msg: Message):
 
 @bot.on_message(
     filters.private & filters.text &
-    ~filters.command(["start","help","ping"])
+    ~filters.command(["start", "help", "ping"])
 )
 async def handle_text(_, msg: Message):
     if not Config.MY_PASS: return
@@ -309,14 +313,19 @@ async def handle_text(_, msg: Message):
         try:
             await db["auth"].update_one(
                 {"uid": msg.from_user.id},
-                {"$set": {"uid": msg.from_user.id}}, upsert=True)
+                {"$set": {"uid": msg.from_user.id}}, upsert=True,
+            )
             await db["pending"].delete_one({"uid": msg.from_user.id})
         except Exception: pass
-        await msg.reply_text("✅ <b>Password correct! Now send your file.</b>",
-                             parse_mode=enums.ParseMode.HTML)
+        await msg.reply_text(
+            "✅ <b>Password correct! Now send your file.</b>",
+            parse_mode=enums.ParseMode.HTML,
+        )
     else:
-        await msg.reply_text("❌ <b>Wrong password.</b> Try again.",
-                             parse_mode=enums.ParseMode.HTML)
+        await msg.reply_text(
+            "❌ <b>Wrong password.</b> Try again.",
+            parse_mode=enums.ParseMode.HTML,
+        )
 
 @bot.on_message(
     filters.channel &
@@ -330,11 +339,13 @@ async def handle_channel(client, msg: Message):
         fwd = await client.copy_message(Config.BIN_CHANNEL, msg.chat.id, msg.id)
         bin_info = get_media_info(fwd)
         if bin_info:
-            info["file_id"]   = bin_info["file_id"]
-            info["mime_type"] = bin_info.get("mime_type") or info["mime_type"]
+            info["file_id"]        = bin_info["file_id"]
+            info["file_unique_id"] = bin_info["file_unique_id"]
+            info["mime_type"]      = bin_info.get("mime_type") or info["mime_type"]
+        await save_file(info, fwd.id)
         dl, page = build_links(
             fwd.id, info["file_name"],
-            info["file_id"], info["mime_type"], info["file_size"]
+            info["file_id"], info["mime_type"], info["file_size"],
         )
         await client.edit_message_reply_markup(
             msg.chat.id, msg.id,
@@ -344,16 +355,16 @@ async def handle_channel(client, msg: Message):
             ]]),
         )
     except Exception as e:
-        log.error(f"Channel error: {e}")
+        log.error(f"Channel handler error: {e}")
 
 # ── Web server ────────────────────────────────────────────────────────────────
 
 async def stream_handler(request: web.Request):
     """
-    GET /stream/{binMsgId}?hash=<encoded>
-    Decodes file_id directly from hash — NO MongoDB lookup needed.
+    GET /stream/{bin_msg_id}?hash=<encoded>
+    Decodes file_id from hash — no DB lookup needed for streaming.
     """
-    h = request.rel_url.query.get("hash", "")
+    h       = request.rel_url.query.get("hash", "")
     payload = decode_hash(h) if h else None
 
     if not payload or not payload.get("f"):
@@ -362,7 +373,7 @@ async def stream_handler(request: web.Request):
     file_id   = payload["f"]
     file_size = payload.get("s", 0)
     mime      = payload.get("m", "application/octet-stream")
-    file_name = request.match_info.get("file_name", "file")
+    file_name = request.match_info.get("bin_msg_id", "file")  # used as fallback label
 
     range_hdr  = request.headers.get("Range", "")
     byte_start = 0
@@ -376,8 +387,8 @@ async def stream_handler(request: web.Request):
     chunk_index = byte_start // CHUNK_SIZE
     skip_bytes  = byte_start % CHUNK_SIZE
 
-    client      = next_client()
-    media_iter  = client.stream_media(file_id, offset=chunk_index).__aiter__()
+    client     = next_client()
+    media_iter = client.stream_media(file_id, offset=chunk_index).__aiter__()
     first_chunk = b""
 
     try:
@@ -389,7 +400,7 @@ async def stream_handler(request: web.Request):
             headers={"Retry-After": str(e.value), "Access-Control-Allow-Origin": "*"},
         )
     except FileIdInvalid:
-        return web.Response(status=410, text="File ID expired.")
+        return web.Response(status=410, text="File ID expired or invalid.")
     except StopAsyncIteration:
         first_chunk = b""
     except Exception as e:
@@ -449,17 +460,35 @@ async def stream_handler(request: web.Request):
     return response
 
 async def info_handler(request: web.Request):
-    """GET /info/{binMsgId}?hash=<encoded> — returns file metadata from hash"""
-    h = request.rel_url.query.get("hash", "")
+    """
+    GET /info/{bin_msg_id}?hash=<encoded>
+    Returns file metadata decoded from hash (no DB needed).
+    Falls back to DB if hash is missing.
+    """
+    h       = request.rel_url.query.get("hash", "")
     payload = decode_hash(h) if h else None
-    if not payload:
-        return web.json_response({"error": "not found"}, status=404)
-    file_name = request.match_info.get("file_name", "file")
-    return web.json_response({
-        "file_name" : file_name,
-        "file_size" : payload.get("s", 0),
-        "mime_type" : payload.get("m", "application/octet-stream"),
-    })
+
+    if payload:
+        return web.json_response({
+            "file_name": request.match_info.get("bin_msg_id", "file"),
+            "file_size": payload.get("s", 0),
+            "mime_type": payload.get("m", "application/octet-stream"),
+        })
+
+    # Fallback: try DB
+    try:
+        bid  = int(request.match_info["bin_msg_id"])
+        info = await db["files"].find_one({"bin_msg_id": bid}, {"_id": 0})
+        if info:
+            return web.json_response({
+                "file_name": info.get("file_name", "file"),
+                "file_size": info.get("file_size", 0),
+                "mime_type": info.get("mime_type", "application/octet-stream"),
+            })
+    except Exception as e:
+        log.warning(f"info DB fallback failed: {e}")
+
+    return web.json_response({"error": "not found"}, status=404)
 
 async def health_handler(_):
     return web.Response(text="OK")
@@ -472,16 +501,16 @@ display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 .b{text-align:center}h1{color:#0088cc;font-size:2rem;margin-bottom:12px}
 p{color:#888}.ok{color:#22c55e;margin-top:16px}</style></head>
 <body><div class="b"><h1>📁 File To Link Bot</h1>
-<p>Pyrogram MTProto · 4 GB Support</p>
-<div class="ok">🟢 Running</div>
+<p>Pyrogram MTProto · 4 GB Support · Cloudflare CDN</p>
+<div class="ok">🟢 Running on Koyeb</div>
 </div></body></html>""")
 
 def build_web_app():
     a = web.Application()
-    a.router.add_get("/",                              home_handler)
-    a.router.add_get("/health",                        health_handler)
-    a.router.add_get("/stream/{bin_msg_id}",           stream_handler)
-    a.router.add_get("/info/{bin_msg_id}",             info_handler)
+    a.router.add_get("/",                    home_handler)
+    a.router.add_get("/health",              health_handler)
+    a.router.add_get("/stream/{bin_msg_id}", stream_handler)
+    a.router.add_get("/info/{bin_msg_id}",   info_handler)
     return a
 
 async def start_web_server():
